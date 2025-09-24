@@ -1,6 +1,7 @@
-import { Telegraf, session, Context } from "telegraf";
+import { Telegraf, session, Context, Markup  } from "telegraf";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { getMint, getAccount } from "@solana/spl-token";
+import { db } from "./lib/db";
 import * as dotenv from "dotenv";
 import Web3 from "web3";
 import { isAddress } from "ethers";
@@ -10,6 +11,7 @@ dotenv.config();
 
 const bot = new Telegraf<MyContext>(process.env.BOT_TOKEN || "");
 const API_KEY = process.env.API_KEY || "";
+const UNISWAP_V4_POOL_MANAGER = process.env.UNISWAP_V4_POOL_MANAGER || "0x000000000004444c5dc75cB358380D2e3dE08A90";
 
 bot.use(session());
 
@@ -20,6 +22,41 @@ const rpcURL = [{
                 }];
 type AnyObject = Record<string, any>;
 type PoolsByDex = Record<string, string[]>;
+// Temporary in-memory map (userId -> payload)
+const callbackStore: Record<string, { token: string; wallets: string[] }> = {};
+
+import { ethers } from "ethers";
+
+const CHAINS = {
+  ethereum: {
+    rpc: "https://eth.llamarpc.com",
+    factory: "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f", // Uniswap V2
+    wrapped: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
+  },
+  bsc: {
+    rpc: "https://bsc-dataseed.binance.org/",
+    factory: "0xCA143Ce32Fe78f1f7019d7d551a6402fC5350c73", // Pancake V2
+    wrapped: "0xBB4CdB9CBd36B01bD1b3EbF2De08d9173bc095c", // WBNB
+  },
+  polygon: {
+    rpc: "https://polygon-rpc.com",
+    factory: "0x5757371414417b8c6caad45baef941abc7d3ab32", // QuickSwap
+    wrapped: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // WMATIC
+  },
+};
+
+
+const factoryAbi = [
+  "function getPair(address tokenA, address tokenB) external view returns (address pair)"
+];
+
+const pairAbi = [
+  "function token0() external view returns (address)",
+  "function token1() external view returns (address)",
+  "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"
+];
+
+
 
 const ERC20_ABI = [
    {
@@ -64,6 +101,140 @@ interface MyContext extends Context {
   session?: MySession;
 }
 
+
+async function getNativePair(chain: keyof typeof CHAINS, token: string) {
+  const { rpc, factory, wrapped } = CHAINS[chain];
+  const provider = new ethers.JsonRpcProvider(rpc);
+
+  const factoryContract = new ethers.Contract(factory, factoryAbi, provider);
+  const pairAddr = await factoryContract.getPair(token, wrapped);
+
+  if (pairAddr === ethers.ZeroAddress) {
+    console.log(`No pair found for ${token} on ${chain}`);
+    return null;
+  }
+
+  const pair = new ethers.Contract(pairAddr, pairAbi, provider);
+  const [t0, t1] = await Promise.all([pair.token0(), pair.token1()]);
+  const { reserve0, reserve1 } = await pair.getReserves();
+
+  return {
+    chain,
+    pair: pairAddr
+  };
+}
+
+
+
+
+// Save user config
+async function saveUserConfig(userId: number, token: string, wallets: string[]) {
+  const walletsJson = JSON.stringify(wallets);
+  await db.query(
+    `INSERT INTO user_config (user_id, token_address, wallets)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE token_address = VALUES(token_address), wallets = VALUES(wallets)`,
+    [userId, token, walletsJson]
+  );
+}
+
+// Load user config
+async function getUserConfig(userId: number): Promise<{ token: string; wallets: string[] } | null> {
+  const [rows] = await db.query(`SELECT * FROM user_config WHERE user_id = ?`, [userId]);
+  const result = (rows as any[])[0];
+  if (!result) return null;
+  return { token: result.token_address, wallets: JSON.parse(result.wallets) };
+}
+
+bot.command("settoken", async (ctx) => {
+  const parts = ctx.message.text.split(" ");
+  if (parts.length < 2) return ctx.reply("Usage: /settoken <tokenAddress>");
+  const token = parts[1];
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  
+  const current = await getUserConfig(userId);
+  const wallets = current?.wallets ?? [];
+
+  await saveUserConfig(userId, token, wallets);
+  ctx.reply(`✅ Token address saved: ${token}`);
+});
+
+bot.command("setwallets", async (ctx) => {
+  const parts = ctx.message.text.split(" ");
+  if (parts.length < 2) return ctx.reply("Usage: /setwallets <wallet1,wallet2,...>");
+  const wallets = parts[1].split(",");
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const current = await getUserConfig(userId);
+  const token = current?.token ?? "";
+
+  await saveUserConfig(userId, token, wallets);
+  ctx.reply(`✅ Wallets saved: ${wallets.join(", ")}`);
+});
+
+bot.command("mystats", async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const config = await getUserConfig(userId);
+  if (!config) return ctx.reply("⚠️ You haven’t set your token and wallets yet.");
+
+  // For now assume chain = Solana (you can extend with BSC/ETH later)
+  const chain = "Solana";
+  const token = config.token;
+  const wallets = config.wallets;
+
+   const tableText = `
+📊 Your Config
+<pre>
+Token | ${token}
+</pre>
+  `;
+ // Save in memory so button only needs userId
+  callbackStore[userId] = { token, wallets };
+  const keyboard = [
+    [Markup.button.callback("📊 Check Token Stats", `check_token_${userId}`)]
+  ];
+
+  ctx.reply(tableText, {
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard(keyboard)
+  });
+
+});
+
+// Handle wallet buttons
+bot.action(/check_wallet_(.+)/, async (ctx) => {
+  const wallet = ctx.match[1];
+  await ctx.answerCbQuery();
+  ctx.reply(`✅ Wallet: <code>${wallet}</code>`, { parse_mode: "HTML" });
+});
+
+
+// Handle token stats button
+bot.action(/check_token_(.+)/, async (ctx) => {
+  const userId = ctx.match[1];
+  const payload = callbackStore[userId];
+  if (!payload) {
+    return ctx.reply("⚠️ Session expired, please run /mystats again.");
+  }
+
+  const { token, wallets } = payload;
+
+  await ctx.answerCbQuery();
+  ctx.reply(
+    `📊 Checking token stats:\n<b>Token:</b> ${token}`,
+    { parse_mode: "HTML" }
+  );
+
+  // 👉 Call getTokenDistribution(token, wallets) here
+  const result =  await getTokenDistribution(token, wallets);
+   await ctx.reply(result, { parse_mode: "HTML" });
+});
+
+
 // Step 1: start command
 bot.start(async (ctx) => {
   ctx.session = {}; // reset session
@@ -73,17 +244,34 @@ bot.start(async (ctx) => {
 
 // Step 2: handle text inputs
 bot.on("text", async (ctx) => {
+  const userId = ctx.from?.id;
+  let token = '';
+  
+  const current = await getUserConfig(userId);
+  const wallets = current?.wallets ?? [];
   const msg = ctx.message.text.trim();
+
 
   if (ctx.session?.step === "awaiting_mint") {
     ctx.session.tokenMint = msg;
+     token = ctx.session.tokenMint;
     ctx.session.step = "awaiting_wallets";
+        await saveUserConfig(userId, token, wallets);
     return ctx.reply("✅ Got the token mint.\nNow send me the *owner wallets*, separated by commas:", { parse_mode: "Markdown" });
   }
 
+
   if (ctx.session?.step === "awaiting_wallets") {
     ctx.session.wallets = msg.split(",").map((w: string) => w.trim());
+    const wallets = ctx.session.wallets;
     ctx.session.step = "done";
+     const userId = ctx.from?.id;
+     if (!userId) return;
+    
+    //store info
+     const current = await getUserConfig(userId);
+     const token = current?.token ?? "";
+     await saveUserConfig(userId, token, wallets);
 
     // 👉 Call your stats function
     if (!ctx.session?.tokenMint || !ctx.session?.wallets) {
@@ -257,21 +445,26 @@ async function ERCTokenInfo(chain: string, tokenMintAddress: string, ownerWallet
   try {
       const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tokenMintAddress}`);
       const data = await res.json();
-
+      let bscPairs: string | any[] = [];
       if (!data.pairs || data.pairs.length === 0) {
-        return "❌ No pools found for this token.";
+        //return "❌ No pools found for this token.";
+      const pairs = await getNativePair("ethereum",tokenMintAddress);
+            bscPairs = [{ chainId: pairs?.chain, pairAddress: pairs?.pair}];
+          console.log(bscPairs);
       }
 
+      if(data.pairs){
       // Only keep BSC pairs
-      const bscPairs = data.pairs.filter((p: any) => p.chainId === "bsc" || p.chainId === "ethereum");
+       bscPairs = data.pairs.filter((p: any) => p.chainId === "bsc" || p.chainId === "ethereum");
+      }
 
       if (bscPairs.length === 0) {
         return "❌ No active pools found for this token.";
       }
       
-        if(bscPairs[0]['chainId'] === 'ethereum'){
-              console.log(rpcURL[0].ethereum)
-        }
+      //  if(bscPairs[0]['chainId'] === 'ethereum'){ console.log(rpcURL[0].ethereum) }
+        
+      //console.log(bscPairs)
       const web3 = new Web3(bscPairs[0]['chainId'] === 'ethereum' ? rpcURL[0].ethereum.toString() : rpcURL[0].bsc.toString()); // mainnet RPC
       const tokenContract = new web3.eth.Contract(ERC20_ABI as any, tokenMintAddress);
 
@@ -281,23 +474,25 @@ async function ERCTokenInfo(chain: string, tokenMintAddress: string, ownerWallet
       const convertToNumber = (amount: bigint) => Number(amount) / Math.pow(10, decimals);
       const totalSupplyNum = convertToNumber(totalSupply);
 
-
-      
     // Sum owner balances
     let ownerBalance = 0;
     for (const wallet of ownerWallets) {
       ownerBalance +=  convertToNumber(BigInt(await tokenContract.methods.balanceOf(wallet).call()));
+      
     }
 
     let dexBalance = 0;
       for (const p of bscPairs) {
-       if (isAddress(p.pairAddress)) 
+       if (isAddress(p.pairAddress)){ 
         dexBalance +=  convertToNumber(BigInt(await tokenContract.methods.balanceOf(p.pairAddress).call()));
+       }else{
+          if(p.chainId === 'ethereum')
+          dexBalance +=  convertToNumber(BigInt(await tokenContract.methods.balanceOf(UNISWAP_V4_POOL_MANAGER).call()));
+          //console.log(dexBalance)
+       }
       }
-      console.log(dexBalance)
 
     const unknownBalance = (totalSupplyNum - dexBalance - ownerBalance);
-    console.log(unknownBalance)
 
     const dexPercent = ((dexBalance) / totalSupplyNum) * 100;
     const ownerPercent = ((ownerBalance) / totalSupplyNum) * 100;
