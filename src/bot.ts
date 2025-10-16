@@ -153,10 +153,10 @@ bot.command("settoken", async (ctx) => {
   const userId = ctx.from?.id;
   if (!userId) return;
   
-  const current = await getUserConfig(userId);
-  const wallets = current?.wallets ?? [];
+ // const current = await getUserConfig(userId);
+  //const wallets = current?.wallets ?? [];
 
-  await saveUserConfig(userId, token, wallets);
+ // await saveUserConfig(userId, token, wallets);
   ctx.reply(`✅ Token address saved: ${token}`);
 });
 
@@ -167,10 +167,10 @@ bot.command("setwallets", async (ctx) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  const current = await getUserConfig(userId);
-  const token = current?.token ?? "";
+ // const current = await getUserConfig(userId);
+  //const token = current?.token ?? "";
 
-  await saveUserConfig(userId, token, wallets);
+  //await saveUserConfig(userId, token, wallets);
   ctx.reply(`✅ Wallets saved: ${wallets.join(", ")}`);
 });
 
@@ -187,7 +187,7 @@ bot.command("mystats", async (ctx) => {
   const wallets = config.wallets;
 
    const tableText = `
-📊 Your Config
+📊 Your history
 <pre>
 Token | ${token}
 </pre>
@@ -247,8 +247,8 @@ bot.on("text", async (ctx) => {
   const userId = ctx.from?.id;
   let token = '';
   
-  const current = await getUserConfig(userId);
-  const wallets = current?.wallets ?? [];
+  //const current = await getUserConfig(userId);
+  //const wallets = current?.wallets ?? [];
   const msg = ctx.message.text.trim();
 
 
@@ -256,7 +256,7 @@ bot.on("text", async (ctx) => {
     ctx.session.tokenMint = msg;
      token = ctx.session.tokenMint;
     ctx.session.step = "awaiting_wallets";
-        await saveUserConfig(userId, token, wallets);
+      //  await saveUserConfig(userId, token, wallets);
     return ctx.reply("✅ Got the token mint.\nNow send me the *owner wallets*, separated by commas:", { parse_mode: "Markdown" });
   }
 
@@ -269,9 +269,9 @@ bot.on("text", async (ctx) => {
      if (!userId) return;
     
     //store info
-     const current = await getUserConfig(userId);
-     const token = current?.token ?? "";
-     await saveUserConfig(userId, token, wallets);
+    // const current = await getUserConfig(userId);
+    // const token = current?.token ?? "";
+    // await saveUserConfig(userId, token, wallets);
 
     // 👉 Call your stats function
     if (!ctx.session?.tokenMint || !ctx.session?.wallets) {
